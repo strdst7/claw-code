@@ -42,6 +42,7 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const CUSTOM_OPENAI_ENV_VARS: &[&str] = &["CLAWCUSTOMOPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
 
 // Provider-specific request body size limits in bytes
@@ -80,6 +81,18 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// OpenAI-compatible endpoint with its own environment namespace and no default URL.
+    #[must_use]
+    pub const fn custom_openai() -> Self {
+        Self {
+            provider_name: "Custom OpenAI",
+            api_key_env: "CLAWCUSTOMOPENAI_API_KEY",
+            base_url_env: "CLAWCUSTOMOPENAI_BASE_URL",
+            default_base_url: "",
+            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
     /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
     /// Requested via Discord #clawcode-get-help: native Alibaba API for
@@ -100,6 +113,7 @@ impl OpenAiCompatConfig {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "Custom OpenAI" => CUSTOM_OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
             _ => &[],
         }
@@ -247,7 +261,7 @@ impl OpenAiCompatClient {
                         .and_then(|t| t.as_str())
                         .map(str::to_owned),
                     message: Some(msg),
-                    request_id,
+                    request_id: request_id.map(String::into_boxed_str),
                     body,
                     retryable: false,
                     suggested_action: suggested_action_for_status(
@@ -1027,7 +1041,12 @@ fn url_host(url: &str) -> &str {
     host_port.split(':').next().unwrap_or("")
 }
 
-fn is_local_openai_compatible_base_url(url: &str) -> bool {
+/// Returns true when `url`'s host is loopback or a private-network address
+/// (`localhost`, `127.0.0.1`, `10.x`, `192.168.x`, `172.16-31.x`). Used to
+/// waive auth requirements for local OpenAI-compatible servers (Ollama, LM
+/// Studio, llama.cpp, vLLM) that don't expect a real API key.
+#[must_use]
+pub fn is_local_openai_compatible_base_url(url: &str) -> bool {
     let host = url_host(url.trim());
     if host.eq_ignore_ascii_case("localhost") || host == "::1" {
         return true;
@@ -1634,7 +1653,7 @@ fn parse_sse_frame(
                 request_id: None,
                 body: trimmed.chars().take(200).collect(),
                 retryable: false,
-                suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+                suggested_action: Some("verify the API endpoint URL is correct"),
                 retry_after: None,
             });
         }
@@ -1687,7 +1706,7 @@ fn parse_sse_frame(
             request_id: None,
             body: payload.chars().take(200).collect(),
             retryable: false,
-            suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+            suggested_action: Some("verify the API endpoint URL is correct"),
             retry_after: None,
         });
     }
@@ -1741,11 +1760,11 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     }
 
     let headers = response.headers().clone();
-    let request_id = request_id_from_headers(&headers);
+    let request_id = request_id_from_headers(&headers).map(String::into_boxed_str);
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_status(status);
-    let retry_after = parse_retry_after(&headers, status);
+    let retryable = is_retryable_status(status) || is_retryable_400(status, &body);
+    let retry_after = parse_retry_after(&headers, status).map(Box::new);
 
     let suggested_action = suggested_action_for_status(status);
 
@@ -1780,7 +1799,10 @@ fn parse_retry_after(
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+    matches!(
+        status.as_u16(),
+        408 | 409 | 429 | 500 | 502 | 503 | 504 | 529
+    )
 }
 
 /// Some providers return HTTP 400 with an unparseable body when a gateway
@@ -1800,14 +1822,14 @@ fn is_retryable_400(status: reqwest::StatusCode, body: &str) -> bool {
 
 /// Generate a suggested user action based on the HTTP status code and error context.
 /// This provides actionable guidance when API requests fail.
-fn suggested_action_for_status(status: reqwest::StatusCode) -> Option<String> {
+fn suggested_action_for_status(status: reqwest::StatusCode) -> Option<&'static str> {
     match status.as_u16() {
-        401 => Some("Check API key is set correctly and has not expired".to_string()),
-        403 => Some("Verify API key has required permissions for this operation".to_string()),
-        413 => Some("Reduce prompt size or context window before retrying".to_string()),
-        429 => Some("Wait a moment before retrying; consider reducing request rate".to_string()),
-        500 => Some("Provider server error - retry after a brief wait".to_string()),
-        502..=504 => Some("Provider gateway error - retry after a brief wait".to_string()),
+        401 => Some("Check API key is set correctly and has not expired"),
+        403 => Some("Verify API key has required permissions for this operation"),
+        413 => Some("Reduce prompt size or context window before retrying"),
+        429 => Some("Wait a moment before retrying; consider reducing request rate"),
+        500 => Some("Provider server error - retry after a brief wait"),
+        502..=504 => Some("Provider gateway error - retry after a brief wait"),
         _ => None,
     }
 }
@@ -1839,11 +1861,12 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        model_requires_reasoning_content_in_history, normalize_finish_reason, normalize_response,
-        openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
-        StreamState,
+        is_retryable_400, is_retryable_status, model_requires_reasoning_content_in_history,
+        normalize_finish_reason, normalize_response, openai_tool_choice, parse_tool_arguments,
+        OpenAiCompatClient, OpenAiCompatConfig, StreamState,
     };
     use crate::error::ApiError;
+    use crate::test_env_lock as env_lock;
     use crate::types::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
         InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, StreamEvent,
@@ -1852,7 +1875,97 @@ mod tests {
     use serde_json::json;
     use std::borrow::Cow;
     use std::collections::BTreeMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn spawn_status_server(status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let response = format!(
+                "HTTP/1.1 {status} STATUS\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        format!("http://{address}/v1/messages")
+    }
+
+    #[tokio::test]
+    async fn expect_success_marks_529_overloaded_retryable() {
+        let url = spawn_status_server(
+            529,
+            r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        let response = reqwest::get(&url).await.expect("response");
+        let error = super::expect_success(response)
+            .await
+            .expect_err("529 should error");
+        assert!(error.is_retryable(), "529 overloaded must be retryable");
+    }
+
+    #[tokio::test]
+    async fn expect_success_marks_gateway_flake_400_retryable() {
+        let url = spawn_status_server(400, "HTTP 400 from backend (no parseable body)");
+        let response = reqwest::get(&url).await.expect("response");
+        let error = super::expect_success(response)
+            .await
+            .expect_err("400 should error");
+        assert!(
+            error.is_retryable(),
+            "gateway-flake 400 body must be retryable"
+        );
+        let url = spawn_status_server(400, "invalid request: max_tokens must be positive");
+        let response = reqwest::get(&url).await.expect("response");
+        let error = super::expect_success(response)
+            .await
+            .expect_err("400 should error");
+        assert!(!error.is_retryable(), "a real 400 must not be retried");
+    }
+    #[test]
+    fn retryable_statuses_are_detected() {
+        assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!is_retryable_status(reqwest::StatusCode::UNAUTHORIZED));
+        // Several OpenAI-compatible gateways (and Anthropic) signal overload
+        // with the non-standard 529; it is transient and must be retried.
+        assert!(is_retryable_status(
+            reqwest::StatusCode::from_u16(529).expect("529 is a valid status")
+        ));
+        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn gateway_flake_400_bodies_are_retryable() {
+        for body in [
+            "HTTP 400 from backend (no parseable body)",
+            "upstream connection reset by peer",
+            "Broken pipe while reading response",
+            "Empty reply from server",
+        ] {
+            assert!(
+                is_retryable_400(reqwest::StatusCode::BAD_REQUEST, body),
+                "body should be retryable: {body}"
+            );
+        }
+        assert!(!is_retryable_400(
+            reqwest::StatusCode::BAD_REQUEST,
+            "invalid request: max_tokens must be positive"
+        ));
+        assert!(!is_retryable_400(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "connection reset"
+        ));
+    }
 
     #[test]
     fn request_translation_uses_openai_compatible_shape() {
@@ -2350,13 +2463,6 @@ mod tests {
             stream: false,
             ..Default::default()
         }
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
     }
 
     #[test]

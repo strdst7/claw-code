@@ -20,7 +20,7 @@ use runtime::{
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file_in_workspace,
+    read_file_in_workspace_with_selector,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
@@ -28,7 +28,7 @@ use runtime::{
     write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
+    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MemoryStore, MessageRole,
     PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
     Session, TaskPacket, ToolError, ToolExecutor,
 };
@@ -1168,6 +1168,33 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "MemoryRead",
+            description: "Read a file from the persistent memory store. The memory store lives outside the workspace (under ~/.claw/projects/<workspace-hash>/memory/) and is not subject to the workspace boundary. Use this to read memory entries or the MEMORY.md index.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Relative path within the memory directory (e.g. 'MEMORY.md' or 'user_role.md')." }
+                },
+                "required": ["file_path"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "MemoryWrite",
+            description: "Write a file to the persistent memory store. The memory store lives outside the workspace (under ~/.claw/projects/<workspace-hash>/memory/) and is not subject to the workspace boundary. Use this to create or update memory entries and the MEMORY.md index. Parent directories are created automatically.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Relative path within the memory directory (e.g. 'MEMORY.md' or 'feedback_style.md')." },
+                    "content": { "type": "string", "description": "Full file content to write." }
+                },
+                "required": ["file_path", "content"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
             name: "LSP",
             description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
             input_schema: json!({
@@ -1479,6 +1506,8 @@ fn execute_tool_with_enforcer(
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
+        "MemoryRead" => from_value::<MemoryReadInput>(input).and_then(run_memory_read),
+        "MemoryWrite" => from_value::<MemoryWriteInput>(input).and_then(run_memory_write),
         "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
         "ListMcpResources" => {
             from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
@@ -1848,6 +1877,96 @@ fn run_cron_list(_input: Value) -> Result<String, String> {
     }))
 }
 
+const MEMORY_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_memory_read(input: MemoryReadInput) -> Result<String, String> {
+    let store = memory_store_for_cwd()?;
+    let target = resolve_memory_path(&store, &input.file_path)?;
+    reject_symlink(&target)?;
+    let meta = std::fs::metadata(&target).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("memory file not found: {}", target.display())
+        } else {
+            format!("failed to read memory file: {e}")
+        }
+    })?;
+    if meta.len() > MEMORY_MAX_FILE_BYTES {
+        return Err(format!(
+            "memory file too large ({} bytes, max {MEMORY_MAX_FILE_BYTES})",
+            meta.len(),
+        ));
+    }
+    let content =
+        std::fs::read_to_string(&target).map_err(|e| format!("failed to read memory file: {e}"))?;
+    to_pretty_json(json!({
+        "file_path": target.display().to_string(),
+        "content": content
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_memory_write(input: MemoryWriteInput) -> Result<String, String> {
+    if input.content.len() as u64 > MEMORY_MAX_FILE_BYTES {
+        return Err(format!(
+            "content too large ({} bytes, max {MEMORY_MAX_FILE_BYTES})",
+            input.content.len(),
+        ));
+    }
+    let store = memory_store_for_cwd()?;
+    let target = resolve_memory_path(&store, &input.file_path)?;
+    store
+        .ensure_dir()
+        .map_err(|e| format!("failed to create memory directory: {e}"))?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create parent directory: {e}"))?;
+    }
+    if target.exists() {
+        reject_symlink(&target)?;
+    }
+    let kind = if target.exists() { "update" } else { "create" };
+    std::fs::write(&target, &input.content)
+        .map_err(|e| format!("failed to write memory file: {e}"))?;
+    to_pretty_json(json!({
+        "type": kind,
+        "file_path": target.display().to_string(),
+        "memory_dir": store.memory_dir().display().to_string()
+    }))
+}
+
+fn reject_symlink(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(format!("refusing to follow symlink: {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn memory_store_for_cwd() -> Result<MemoryStore, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    Ok(MemoryStore::for_workspace(&cwd))
+}
+
+fn resolve_memory_path(store: &MemoryStore, relative: &str) -> Result<PathBuf, String> {
+    let relative = relative.trim();
+    if relative.is_empty() {
+        return Err("file_path must not be empty".to_string());
+    }
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        return Err("file_path must be relative to the memory directory, not absolute".to_string());
+    }
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err("file_path must not contain '..' components".to_string());
+    }
+    Ok(store.memory_dir().join(path))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_lsp(input: LspInput) -> Result<String, String> {
     let registry = global_lsp_registry();
@@ -1977,9 +2096,13 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
             let status = response.status().as_u16();
             let body = response.text().unwrap_or_default();
             let truncated_body = if body.len() > 8192 {
+                let mut end = 8192;
+                while !body.is_char_boundary(end) {
+                    end -= 1;
+                }
                 format!(
                     "{}\n\n[response truncated — {} bytes total]",
-                    &body[..8192],
+                    &body[..end],
                     body.len()
                 )
             } else {
@@ -2450,8 +2573,14 @@ fn branch_divergence_output(
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
-            .map_err(io_to_string)?,
+        read_file_in_workspace_with_selector(
+            &input.path,
+            input.offset,
+            input.limit,
+            input.selector.as_deref(),
+            &workspace,
+        )
+        .map_err(io_to_string)?,
     )
 }
 
@@ -2599,7 +2728,7 @@ fn path_within_current_workspace(path: &str, allow_missing: bool) -> bool {
             '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
         )
     });
-    if looks_like_windows_absolute_path(trimmed) {
+    if !cfg!(windows) && looks_like_windows_absolute_path(trimmed) {
         return false;
     }
 
@@ -2766,6 +2895,7 @@ struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+    selector: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3014,6 +3144,17 @@ struct CronCreateInput {
 #[derive(Debug, Deserialize)]
 struct CronDeleteInput {
     cron_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryReadInput {
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryWriteInput {
+    file_path: String,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3391,16 +3532,26 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
     let client = build_http_client()?;
     let search_url = build_search_url(&input.query)?;
     let response = client
-        .get(search_url)
+        .get(search_url.as_str())
         .send()
         .map_err(|error| error.to_string())?;
+
+    // DuckDuckGo answers its bot challenge with HTTP 202 and a page without
+    // results, so anything but 200 is an unusable results page.
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        return Err(format!(
+            "Web search unavailable (HTTP {}) - the search provider is blocked or unreachable",
+            status.as_u16()
+        ));
+    }
 
     let final_url = response.url().clone();
     let html = response.text().map_err(|error| error.to_string())?;
     let mut hits = extract_search_hits(&html);
 
     if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
+        hits = extract_search_hits_from_generic_links(&html, search_url.host_str());
     }
 
     if let Some(allowed) = input.allowed_domains.as_ref() {
@@ -3623,7 +3774,7 @@ fn extract_search_hits(html: &str) -> Vec<SearchHit> {
     hits
 }
 
-fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
+fn extract_search_hits_from_generic_links(html: &str, search_host: Option<&str>) -> Vec<SearchHit> {
     let mut hits = Vec::new();
     let mut remaining = html;
 
@@ -3654,6 +3805,11 @@ fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
         }
         let decoded_url = decode_duckduckgo_redirect(&url).unwrap_or(url);
         if decoded_url.starts_with("http://") || decoded_url.starts_with("https://") {
+            if is_search_engine_link(&decoded_url, search_host) {
+                remaining = &after_tag[end_anchor_idx + 4..];
+                continue;
+            }
+
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
@@ -3734,6 +3890,20 @@ fn normalize_domain_filter(domain: &str) -> String {
         .trim_start_matches('.')
         .trim_end_matches('/')
         .to_ascii_lowercase()
+}
+
+/// A generic-fallback link that points back at DuckDuckGo or at the configured
+/// search host is page chrome (home, settings, challenge), never a result.
+fn is_search_engine_link(url: &str, search_host: Option<&str>) -> bool {
+    let Some(host) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    host == "duckduckgo.com"
+        || host.ends_with(".duckduckgo.com")
+        || search_host.is_some_and(|search_host| host.eq_ignore_ascii_case(search_host))
 }
 
 fn dedupe_hits(hits: &mut Vec<SearchHit>) {
@@ -4237,6 +4407,7 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
         DEFAULT_AGENT_SYSTEM_DATE.to_string(),
         std::env::consts::OS,
         "unknown",
+        model,
         model_family_identity_for(model),
     )
     .map_err(|error| error.to_string())?;
@@ -5388,52 +5559,97 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     messages
         .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => InputContentBlock::Thinking {
-                        thinking: thinking.clone(),
-                        signature: signature.clone(),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .filter(
-                    |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
-                )
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
-            })
+        .filter_map(convert_message)
+        .fold(Vec::new(), absorb_tool_result_message)
+}
+
+/// Converts one conversation message into its wire form.
+fn convert_message(message: &ConversationMessage) -> Option<InputMessage> {
+    let role = match message.role {
+        MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+        MessageRole::Assistant => "assistant",
+    };
+    let content = message
+        .blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => InputContentBlock::Thinking {
+                thinking: thinking.clone(),
+                signature: signature.clone(),
+            },
+            ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: serde_json::from_str(input)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => InputContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: output.clone(),
+                }],
+                is_error: *is_error,
+            },
         })
-        .collect()
+        .filter(|block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()))
+        .collect::<Vec<_>>();
+    (!content.is_empty()).then(|| InputMessage {
+        role: role.to_string(),
+        content,
+    })
+}
+
+/// Identical in `rusty-claude-cli` and `tools`; kept in both copies by review
+/// decision rather than shared, but they must still be changed together.
+///
+/// The two `convert_messages` call sites are not interchangeable: `tools` drops
+/// empty `Text` blocks and the CLI keeps them. That difference is confined to
+/// `convert_message`, so it constrains hoisting the whole conversion, not this
+/// fold. It is reachable when history is not built from the model stream — an
+/// empty `user_text("")` or a persisted `"text":""` restored from a session log
+/// bypasses the `flush_text_block` filter that the streaming path applies.
+/// Appends a message, merging a run of pure tool-result messages into one.
+///
+/// `runtime` records one `MessageRole::Tool` message per tool call, but the
+/// Anthropic Messages API requires every `tool_use` of an assistant turn to be
+/// answered by `tool_result` blocks in the single message that follows it, so a
+/// parallel tool-call turn must not reach the provider as one message per
+/// result. A merge requires both the accumulated message and the incoming one to
+/// be pure tool results: checking only the accumulated side would fold the
+/// assistant reply that follows a tool result into the tool-result message and
+/// lose its role.
+fn absorb_tool_result_message(
+    mut messages: Vec<InputMessage>,
+    message: InputMessage,
+) -> Vec<InputMessage> {
+    if is_tool_result_only(&message) {
+        if let Some(previous) = messages.last_mut() {
+            if previous.role == "user" && is_tool_result_only(previous) {
+                previous.content.extend(message.content);
+                return messages;
+            }
+        }
+    }
+    messages.push(message);
+    messages
+}
+
+/// Reports whether a wire message carries tool results and nothing else.
+fn is_tool_result_only(message: &InputMessage) -> bool {
+    !message.content.is_empty()
+        && message
+            .content
+            .iter()
+            .all(|block| matches!(block, InputContentBlock::ToolResult { .. }))
 }
 
 fn push_output_block(
@@ -5781,7 +5997,7 @@ fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput,
         NotebookEditMode::Insert => {
             let resolved_cell_type = resolved_cell_type
                 .ok_or_else(|| String::from("insert mode requires a cell type"))?;
-            let new_id = make_cell_id(cells.len());
+            let new_id = make_cell_id(cells);
             let new_cell = build_notebook_cell(&new_id, resolved_cell_type, &new_source);
             let insert_at = target_index.map_or(cells.len(), |index| index + 1);
             cells.insert(insert_at, new_cell);
@@ -6217,15 +6433,19 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
 }
 
 struct ReplRuntime {
-    program: &'static str,
+    program: PathBuf,
     args: &'static [&'static str],
 }
 
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     match language.trim().to_ascii_lowercase().as_str() {
         "python" | "py" => Ok(ReplRuntime {
-            program: detect_first_command(&["python3", "python"])
-                .ok_or_else(|| String::from("python runtime not found"))?,
+            program: detect_first_command(if cfg!(windows) {
+                &["python", "python3"]
+            } else {
+                &["python3", "python"]
+            })
+            .ok_or_else(|| String::from("python runtime not found"))?,
             args: &["-c"],
         }),
         "javascript" | "js" | "node" => Ok(ReplRuntime {
@@ -6242,11 +6462,8 @@ fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     }
 }
 
-fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
-    commands
-        .iter()
-        .copied()
-        .find(|command| command_exists(command))
+fn detect_first_command(commands: &[&str]) -> Option<PathBuf> {
+    commands.iter().find_map(|command| resolve_command(command))
 }
 
 #[derive(Clone, Copy)]
@@ -6570,37 +6787,62 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     }
     let shell = detect_powershell_shell()?;
     execute_shell_command(
-        shell,
+        &shell,
         &input.command,
         input.timeout,
         input.run_in_background,
     )
 }
 
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
-    } else {
-        Err(std::io::Error::new(
+fn detect_powershell_shell() -> std::io::Result<PathBuf> {
+    detect_first_command(&["pwsh", "powershell"]).ok_or_else(|| {
+        std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "PowerShell executable not found (expected `pwsh` or `powershell` in PATH)",
-        ))
-    }
+        )
+    })
 }
 
-fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .is_ok_and(|status| status.success())
+// Resolve the same executable that we will launch, without invoking a login
+// shell (which can replace PATH). Windows also needs the selected extension:
+// Command does not apply PATHEXT when given a bare program name.
+fn resolve_command(command: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    #[cfg(windows)]
+    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(command);
+        #[cfg(windows)]
+        {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            for extension in extensions
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+            {
+                let candidate = directory.join(format!("{command}{extension}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::metadata(&candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            }) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_lines)]
 fn execute_shell_command(
-    shell: &str,
+    shell: &Path,
     command: &str,
     timeout: Option<u64>,
     run_in_background: Option<bool>,
@@ -6806,8 +7048,11 @@ fn format_notebook_edit_mode(mode: NotebookEditMode) -> String {
     }
 }
 
-fn make_cell_id(index: usize) -> String {
-    format!("cell-{}", index + 1)
+fn make_cell_id(cells: &[Value]) -> String {
+    (cells.len() + 1..)
+        .map(|n| format!("cell-{n}"))
+        .find(|id| !cells.iter().any(|cell| cell["id"] == id.as_str()))
+        .expect("there is always a free id")
 }
 
 fn parse_skill_description(contents: &str) -> Option<String> {
@@ -6839,19 +7084,20 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_cron_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        absorb_tool_result_message, agent_permission_policy, allowed_tools_for_subagent,
+        build_agent_system_prompt, classify_lane_failure, convert_message, derive_agent_state,
+        execute_agent_with_spawn, execute_tool, extract_recovery_outcome, final_assistant_text,
+        global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
         GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
         SubagentToolExecutor,
     };
-    use api::OutputContentBlock;
+    use api::{InputContentBlock, InputMessage, OutputContentBlock};
     use runtime::ProviderFallbackConfig;
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        permission_enforcer::PermissionEnforcer, ApiClient, ApiRequest, AssistantEvent,
+        ContentBlock, ConversationMessage, ConversationRuntime, PermissionMode, PermissionPolicy,
+        RuntimeError, Session, TaskPacket, ToolExecutor,
     };
     use serde_json::json;
 
@@ -7132,7 +7378,7 @@ mod tests {
         fs::create_dir_all(&claw_dir).expect("create .claw dir");
         // Use the actual OS temp dir so the worktree path matches the allowlist
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
-        let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
+        let settings = json!({"trustedRoots": [tmp_root]}).to_string();
         fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
@@ -8090,6 +8336,112 @@ mod tests {
     }
 
     #[test]
+    fn web_search_returns_error_on_non_2xx_response() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=test"));
+            // Simulate rate-limited/blocked response (HTTP 429)
+            HttpResponse::html(
+                429,
+                "Too Many Requests",
+                "<html><body>\n                  <p>Too many requests. Please try again later.</p>\n                </body></html>",
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "test" }))
+            .expect_err("non-2xx response should fail");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        assert!(error.contains("Web search unavailable"));
+        assert!(error.contains("429"));
+    }
+
+    #[test]
+    fn web_search_rejects_duckduckgo_202_challenge_page() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /html/?q=challenge "));
+            HttpResponse::html(
+                202,
+                "Accepted",
+                r#"
+                <html><body>
+                  <a href="/html/">DuckDuckGo</a>
+                  <a href="https://duckduckgo.com/">Home</a>
+                  <p>Unfortunately, bots use DuckDuckGo too.</p>
+                </body></html>
+                "#,
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "challenge" }))
+            .expect_err("a 202 challenge page must not produce results");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        assert!(
+            error.contains("Web search unavailable (HTTP 202)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn web_search_generic_fallback_drops_search_engine_links() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=chrome+links "));
+            HttpResponse::html(
+                200,
+                "OK",
+                r#"
+                <html><body>
+                  <a href="/html/">DuckDuckGo</a>
+                  <a href="https://html.duckduckgo.com/html/?q=x">Next page</a>
+                  <a href="https://duckduckgo.com/settings">Settings</a>
+                  <a href="https://docs.rs/serde">Serde Docs</a>
+                  <a href="https://tokio.rs/">Tokio</a>
+                </body></html>
+                "#,
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let result = execute_tool("WebSearch", &json!({ "query": "chrome links" }))
+            .expect("WebSearch fallback parsing should succeed");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let content = output["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .find_map(|item| item.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .expect("search result block present");
+        let urls: Vec<&str> = content
+            .iter()
+            .map(|hit| hit["url"].as_str().expect("url"))
+            .collect();
+        assert_eq!(urls, ["https://docs.rs/serde", "https://tokio.rs/"]);
+    }
+
+    #[test]
     fn pending_tools_preserve_multiple_streaming_tool_calls_by_index() {
         let mut events = Vec::new();
         let mut pending_tools = BTreeMap::new();
@@ -8277,6 +8629,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
@@ -8296,6 +8649,7 @@ mod tests {
         assert!(dollar_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
 
         if let Some(home) = original_home {
@@ -8335,6 +8689,7 @@ mod tests {
         assert!(skill_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claw/skills/plan/SKILL.md"));
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
@@ -8344,6 +8699,7 @@ mod tests {
         assert!(command_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claw/commands/handoff.md"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -8382,6 +8738,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claude/skills/trace/SKILL.md"));
         assert_eq!(output["description"], "Project-local trace helper");
 
@@ -8444,11 +8801,13 @@ mod tests {
         assert!(omc_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".omc/skills/hud/SKILL.md"));
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
         assert!(agents_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".agents/skills/trace/SKILL.md"));
         assert_eq!(
             agents_output["description"],
@@ -8504,6 +8863,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("skills/omc-learned/learned/SKILL.md"));
         assert_eq!(output["description"], "Learned OMC skill");
 
@@ -8563,6 +8923,7 @@ mod tests {
         assert!(direct_skill_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("skills/statusline/SKILL.md"));
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
@@ -8573,6 +8934,7 @@ mod tests {
         assert!(legacy_command_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("commands/doctor-check.md"));
         assert_eq!(
             legacy_command_output["description"],
@@ -8630,6 +8992,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claude/commands/team.md"));
         assert_eq!(output["description"], "Legacy team workflow");
 
@@ -9370,7 +9733,8 @@ mod tests {
 
         // then: the prompt renders a generic model family identity
         assert!(prompt.contains("Model family: an AI assistant"));
-        assert!(!prompt.contains("Model family: Claude Opus 4.6"));
+        assert!(!prompt.contains("Model family: Claude"));
+        assert!(prompt.contains("Model: openai/gpt-4.1-mini"));
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
@@ -9545,15 +9909,115 @@ mod tests {
         assert!(deleted_output["cell_type"].is_null());
         assert_eq!(deleted_output["new_source"], "");
 
+        let reinserted = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "new_source": "print(4)\n",
+                "edit_mode": "insert"
+            }),
+        )
+        .expect("NotebookEdit insert after delete should succeed");
+        let reinserted_output: serde_json::Value = serde_json::from_str(&reinserted).expect("json");
+        assert_eq!(reinserted_output["cell_id"], "cell-4");
+
         let final_notebook: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read notebook"))
                 .expect("valid notebook json");
         let cells = final_notebook["cells"].as_array().expect("cells array");
-        assert_eq!(cells.len(), 2);
+        assert_eq!(cells.len(), 3);
         assert_eq!(cells[0]["cell_type"], "markdown");
         assert!(cells[0].get("outputs").is_none());
         assert_eq!(cells[1]["cell_type"], "code");
         assert_eq!(cells[1]["source"][0], "print(3)\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn notebook_edit_replace_switches_cell_type_and_rejects_unknown_ids() {
+        let path = temp_path("retype.ipynb");
+        std::fs::write(
+            &path,
+            r##"{
+  "cells": [
+    {"cell_type": "markdown", "id": "cell-2", "metadata": {}, "source": ["# title\n"]}
+  ],
+  "metadata": {},
+  "nbformat": 4,
+  "nbformat_minor": 5
+}"##,
+        )
+        .expect("write notebook");
+
+        let kept_type = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "cell_id": "cell-2",
+                "new_source": "# renamed\n"
+            }),
+        )
+        .expect("NotebookEdit default replace should succeed");
+        let kept_output: serde_json::Value = serde_json::from_str(&kept_type).expect("json");
+        assert_eq!(kept_output["edit_mode"], "replace");
+        assert_eq!(kept_output["cell_type"], "markdown");
+        assert_eq!(kept_output["language"], "python");
+
+        let retyped = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "cell_id": "cell-2",
+                "new_source": "print(1)\n",
+                "cell_type": "code",
+                "edit_mode": "replace"
+            }),
+        )
+        .expect("NotebookEdit replace to code should succeed");
+        let retyped_output: serde_json::Value = serde_json::from_str(&retyped).expect("json");
+        assert_eq!(retyped_output["cell_type"], "code");
+
+        let inserted = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "new_source": "print(2)\n",
+                "edit_mode": "insert"
+            }),
+        )
+        .expect("NotebookEdit insert should succeed");
+        let inserted_output: serde_json::Value = serde_json::from_str(&inserted).expect("json");
+        assert_eq!(inserted_output["cell_id"], "cell-3");
+
+        let before_missing = std::fs::read_to_string(&path).expect("read notebook");
+        let missing = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "cell_id": "missing",
+                "new_source": "print(3)\n",
+                "edit_mode": "replace"
+            }),
+        )
+        .expect_err("unknown cell id should fail");
+        assert!(missing.contains("Cell id not found: missing"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read notebook"),
+            before_missing
+        );
+
+        let final_notebook: serde_json::Value =
+            serde_json::from_str(&before_missing).expect("valid notebook json");
+        let cells = final_notebook["cells"].as_array().expect("cells array");
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0]["cell_type"], "code");
+        assert_eq!(cells[0]["source"], json!(["print(1)\n"]));
+        assert_eq!(cells[0]["outputs"], json!([]));
+        assert_eq!(
+            cells[0].get("execution_count"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(cells[1]["id"], "cell-3");
         let _ = std::fs::remove_file(path);
     }
 
@@ -9874,6 +10338,7 @@ mod tests {
         assert!(globbed_output["filenames"][0]
             .as_str()
             .expect("filename")
+            .replace('\\', "/")
             .ends_with("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
@@ -10326,7 +10791,14 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("create dir");
-        let script = dir.join("pwsh");
+        let script = dir.join(if cfg!(windows) { "pwsh.cmd" } else { "pwsh" });
+        #[cfg(windows)]
+        std::fs::write(
+            &script,
+            "@echo off\r\n<nul set /p \"=pwsh:%~4\"\r\nexit /b 0\r\n",
+        )
+        .expect("write Windows shell stub");
+        #[cfg(unix)]
         std::fs::write(
             &script,
             r#"#!/bin/sh
@@ -10336,13 +10808,15 @@ printf 'pwsh:%s' "$1"
 "#,
         )
         .expect("write script");
-        std::process::Command::new("/bin/chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .expect("chmod");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("make shell stub executable");
+        }
         let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        let paths = std::iter::once(dir.clone()).chain(std::env::split_paths(&original_path));
+        std::env::set_var("PATH", std::env::join_paths(paths).expect("fixture PATH"));
 
         let result = execute_tool(
             "PowerShell",
@@ -10555,6 +11029,43 @@ printf 'pwsh:%s' "$1"
         let registry = read_only_registry();
         let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
         assert!(result.is_ok(), "read_file should be allowed: {result:?}");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn given_read_only_enforcer_when_read_file_with_selector_then_succeeds() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("perm-read-selector");
+        fs::create_dir_all(&root).expect("create root");
+        let file = root.join("multi-line.txt");
+        fs::write(&file, "line1\nline2\nline3\nline4\nline5\n").expect("write test file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let registry = read_only_registry();
+        let result = registry.execute(
+            "read_file",
+            &json!({
+                "path": file.display().to_string(),
+                "selector": "2-4"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "read_file with selector should succeed: {result:?}"
+        );
+
+        // Verify the output contains the expected lines
+        let output: serde_json::Value =
+            serde_json::from_str(&result.unwrap()).expect("json output");
+        let content = output["file"]["content"].as_str().expect("content field");
+        assert!(content.contains("line2"));
+        assert!(content.contains("line3"));
+        assert!(content.contains("line4"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
@@ -10888,5 +11399,240 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+    fn tool_result_message(id: &str) -> runtime::ConversationMessage {
+        ConversationMessage::tool_result(id, "bash", "ok", false)
+    }
+
+    #[test]
+    fn subagent_parallel_tool_results_share_one_message() {
+        let messages = vec![
+            ConversationMessage::user_text("go"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: "{\"command\":\"pwd\"}".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-2".to_string(),
+                    name: "bash".to_string(),
+                    input: "{\"command\":\"ls\"}".to_string(),
+                },
+            ]),
+            tool_result_message("tool-1"),
+            tool_result_message("tool-2"),
+        ];
+
+        let converted = super::convert_messages(&messages);
+
+        assert_eq!(converted.len(), 3, "converted: {converted:?}");
+        let answered = converted[2]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                InputContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(answered, vec!["tool-1", "tool-2"]);
+    }
+
+    #[test]
+    fn subagent_merge_requires_both_sides_to_be_tool_results() {
+        let merged = absorb_tool_result_message(
+            vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    content: vec![api::ToolResultContentBlock::Text {
+                        text: "ok".to_string(),
+                    }],
+                    is_error: false,
+                }],
+            }],
+            convert_message(&ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }]))
+            .expect("assistant reply converts"),
+        );
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "the reply after a tool result must stay its own message: {merged:?}"
+        );
+        assert_eq!(merged[1].role, "assistant");
+    }
+
+    #[test]
+    fn subagent_wire_request_pairs_parallel_tool_results() {
+        // The subagent path reaches `convert_messages` only through
+        // `ProviderRuntimeClient::stream`, and that conversion is private, so the
+        // contract has to be checked on the bytes that leave the process: drive the
+        // client against the mock service and assert on the captured body.
+        let _lock = env_guard();
+        // The service must keep serving while this thread blocks inside
+        // `stream()`, so its runtime needs worker threads rather than
+        // `new_current_thread`.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        let server = runtime
+            .block_on(mock_anthropic_service::MockAnthropicService::spawn())
+            .expect("mock service should start");
+
+        // Point the client at the mock: the base URL and both credential variables
+        // are read from the process environment, and this developer shell sets
+        // ANTHROPIC_BASE_URL, so restore whatever was there before.
+        let original_key = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_token = std::env::var_os("ANTHROPIC_AUTH_TOKEN");
+        let original_base = std::env::var_os("ANTHROPIC_BASE_URL");
+        std::env::set_var("ANTHROPIC_API_KEY", "tools-wire-test-key");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::set_var("ANTHROPIC_BASE_URL", server.base_url());
+        let restore = || {
+            for (key, value) in [
+                ("ANTHROPIC_API_KEY", original_key.clone()),
+                ("ANTHROPIC_AUTH_TOKEN", original_token.clone()),
+                ("ANTHROPIC_BASE_URL", original_base.clone()),
+            ] {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        };
+
+        // A turn whose two tool calls already have results: this is exactly the
+        // history `convert_messages` used to split into two wire messages.
+        let messages = vec![
+            ConversationMessage::user_text(format!(
+                "{}multi_tool_turn_roundtrip",
+                mock_anthropic_service::SCENARIO_PREFIX
+            )),
+            ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "toolu_multi_read".to_string(),
+                    name: "read_file".to_string(),
+                    input: r#"{"path":"fixture.txt"}"#.to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_multi_grep".to_string(),
+                    name: "grep_search".to_string(),
+                    input: r#"{"pattern":"parity","path":"fixture.txt"}"#.to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result(
+                "toolu_multi_read",
+                "read_file",
+                "alpha parity",
+                false,
+            ),
+            ConversationMessage::tool_result("toolu_multi_grep", "grep_search", "2", false),
+        ];
+
+        let mut client = ProviderRuntimeClient::new_with_fallback_config(
+            "sonnet".to_string(),
+            BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
+            &ProviderFallbackConfig::default(),
+        )
+        .expect("provider client");
+        let _ = client.stream(ApiRequest {
+            system_prompt: Vec::new(),
+            messages,
+        });
+
+        let captured = runtime.block_on(server.captured_requests());
+        restore();
+        drop(runtime);
+        let captured = captured
+            .iter()
+            .filter(|request| request.path == "/v1/messages")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captured.len(),
+            1,
+            "one message request should leave the client"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&captured[0].raw_body).expect("request body is json");
+        let wire = body["messages"].as_array().expect("messages array");
+
+        // The two tool results must share one user message: pairing requires every
+        // tool_use of an assistant turn to be answered in the message right after it.
+        let result_messages = wire
+            .iter()
+            .filter(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
+            })
+            .count();
+        assert_eq!(result_messages, 1, "wire body: {body}");
+        let call_messages = wire
+            .iter()
+            .filter(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_use"))
+            })
+            .count();
+        assert_eq!(call_messages, 1, "wire body: {body}");
+
+        let answered = wire
+            .iter()
+            .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+            .filter(|block| block["type"] == "tool_result")
+            .filter_map(|block| block["tool_use_id"].as_str().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(answered, vec!["toolu_multi_read", "toolu_multi_grep"]);
+    }
+
+    #[test]
+    fn remote_trigger_truncates_multibyte_char_at_boundary() {
+        // This test verifies that run_remote_trigger safely truncates a body
+        // when a multibyte UTF-8 character spans the 8192-byte boundary.
+        // Without the char_boundary check, &body[..8192] would panic.
+        let server = TestServer::spawn(Arc::new(|_request| {
+            // Create a body that's >8192 bytes with a 4-byte character (🦀) at byte 8192.
+            // Strategy: fill with ASCII to reach byte 8189, then place the 4-byte crab emoji
+            // so that byte 8192 falls in the middle of it.
+            let mut body = String::new();
+            // 8189 ASCII 'a' characters = 8189 bytes
+            for _ in 0..8189 {
+                body.push('a');
+            }
+            // Crab emoji (🦀) is 4 bytes in UTF-8: F0 9F A6 80
+            // Placing it now puts byte 8192 inside it (byte 8189+3=8192 is the 4th byte of the emoji)
+            body.push('\u{1F980}');
+            // Add more content to make it clear we truncated
+            body.push_str("extra_content_after_boundary");
+
+            HttpResponse::text(200, "OK", &body)
+        }));
+
+        let input = json!({
+            "url": format!("http://{}/test", server.addr()),
+            "method": "GET"
+        });
+
+        // This should not panic on the current head (with char_boundary check).
+        // On main (with &body[..8192]), this would panic because byte 8192
+        // is in the middle of the 4-byte crab emoji.
+        let result = execute_tool("RemoteTrigger", &input).expect("tool should succeed");
+        let output: serde_json::Value =
+            serde_json::from_str(&result).expect("result should be valid JSON");
+
+        // Verify the response was truncated
+        let body = output["body"].as_str().expect("body should be string");
+        assert!(body.contains("[response truncated"));
+        // The body should not contain the full extra_content_after_boundary
+        assert!(!body.contains("extra_content_after_boundary"));
+        // The truncation should have left us with valid UTF-8 (no partial emoji)
+        let _ = body.to_string(); // This validates it's valid Rust string (which is valid UTF-8)
     }
 }

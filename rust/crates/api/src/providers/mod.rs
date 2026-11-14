@@ -270,6 +270,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
+    // Groq compound systems and Groq-namespaced model ids are served through
+    // the OpenAI-compatible transport selected by OPENAI_BASE_URL.
+    if canonical.starts_with("groq/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        });
+    }
     // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
     // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
     // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
@@ -666,11 +676,26 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
+        // Groq Llama 4 models accept tool calling but cap completions below
+        // Claw's 64k fallback heuristic. Encode the provider limit so prompts
+        // fit inside Groq's request validation and TPM budget.
+        "llama-4-scout-17b-16e-instruct" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
         "qwen-max" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
         "qwen-plus" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
+        // Groq compound systems are exposed through an OpenAI-compatible API
+        // but cap completions at 8,192 output tokens. Without this metadata
+        // Claw uses its 64k fallback heuristic and the provider rejects the
+        // request before generation starts.
+        "compound" | "compound-mini" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
@@ -748,12 +773,14 @@ fn env_or_dotenv_present(key: &str) -> bool {
     }
 }
 
-/// Produce a hint string describing the first foreign provider credential
-/// that is present in the environment when Anthropic auth resolution has
-/// just failed. Returns `None` when no foreign credential is set, in which
-/// case the caller should fall back to the plain `missing_credentials`
-/// error without a hint.
+/// Produce a hint string describing the most probable reason Anthropic auth
+/// resolution just failed. Returns `None` when nothing in the environment
+/// explains the failure, in which case the caller should fall back to the
+/// plain `missing_credentials` error without a hint.
 pub(crate) fn anthropic_missing_credentials_hint() -> Option<String> {
+    if let Some(hint) = custom_anthropic_base_url_hint() {
+        return Some(hint);
+    }
     for (env_var, provider_label, fix_hint) in FOREIGN_PROVIDER_ENV_VARS {
         if env_or_dotenv_present(env_var) {
             return Some(format!(
@@ -762,6 +789,34 @@ pub(crate) fn anthropic_missing_credentials_hint() -> Option<String> {
         }
     }
     None
+}
+
+/// Hint for the case where `ANTHROPIC_BASE_URL` points at something other than
+/// the Anthropic API.
+///
+/// Third-party Anthropic-compatible endpoints (DeepSeek's `/anthropic` path,
+/// corporate gateways, local proxies) authenticate with the `ANTHROPIC_API_KEY`
+/// and `ANTHROPIC_AUTH_TOKEN` variable names purely by wire-compatibility
+/// convention, so the standard missing-credential message reads as "go get an
+/// Anthropic key" when the user in fact needs a credential issued by the
+/// endpoint they already configured. Nothing in that message mentions the base
+/// URL, which is the one piece of configuration the user deliberately set.
+///
+/// This takes precedence over the foreign-provider hints: a configured endpoint
+/// is a fact about what the user asked for, while a presence check on another
+/// provider's key only guesses at intent.
+fn custom_anthropic_base_url_hint() -> Option<String> {
+    let base_url = anthropic::read_base_url();
+    let base_url = base_url.trim();
+    if base_url.is_empty() || base_url == anthropic::DEFAULT_BASE_URL {
+        return None;
+    }
+    Some(format!(
+        "ANTHROPIC_BASE_URL is set to {base_url}, which is not the Anthropic API. \
+         The ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN variable names are a \
+         compatibility convention — this endpoint expects a credential it issued \
+         itself, not an Anthropic key."
+    ))
 }
 
 /// Build an Anthropic-specific `MissingCredentials` error, attaching a
@@ -836,8 +891,8 @@ pub(crate) fn dotenv_value(key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_env_lock as env_lock;
     use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
 
     use serde_json::json;
 
@@ -854,17 +909,6 @@ mod tests {
         provider_diagnostics_for_request, resolve_model_alias, ProviderFeatureSupport,
         ProviderKind, ProviderWireProtocol,
     };
-
-    /// Serializes every test in this module that mutates process-wide
-    /// environment variables so concurrent test threads cannot observe
-    /// each other's partially-applied state while probing the foreign
-    /// provider credential sniffer.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     /// Snapshot-restore guard for a single environment variable. Captures
     /// the original value on construction, applies the requested override
@@ -900,6 +944,135 @@ mod tests {
         assert_eq!(resolve_model_alias("grok"), "grok-3");
         assert_eq!(resolve_model_alias("grok-mini"), "grok-3-mini");
         assert_eq!(resolve_model_alias("grok-2"), "grok-2");
+    }
+
+    /// Collects every non-empty backtick-delimited span in a markdown cell.
+    fn backticked(cell: &str) -> Vec<&str> {
+        let mut spans = Vec::new();
+        let mut rest = cell;
+        while let Some(start) = rest.find('`') {
+            let after_open = &rest[start + 1..];
+            let Some(end) = after_open.find('`') else {
+                break;
+            };
+            spans.push(&after_open[..end]);
+            rest = &after_open[end + 1..];
+        }
+        spans
+    }
+
+    // Locks the `## Model Aliases` table in `rust/README.md` to the resolver.
+    //
+    // The table and the alias set must agree in *both* directions: no alias may
+    // resolve without being documented, and none may be documented without
+    // resolving. The table previously listed only the three Anthropic aliases
+    // while the resolver had grown xAI and Kimi entries, so an alias could work
+    // undocumented — exactly the drift a parity test catches and a hand-written
+    // `assert_eq!` per alias does not.
+    #[test]
+    fn readme_alias_table_matches_resolver() {
+        // `rust/crates/api/src/providers/mod.rs` -> `rust/README.md`.
+        const README: &str = include_str!("../../../../README.md");
+
+        let section = README
+            .split("## Model Aliases")
+            .nth(1)
+            .expect("rust/README.md must keep a `## Model Aliases` section");
+        let section = section.split("\n## ").next().unwrap_or(section);
+
+        // (alias, documented canonical id, documented auth env var)
+        let mut documented: Vec<(String, String, String)> = Vec::new();
+        for line in section.lines() {
+            let line = line.trim();
+            let Some(row) = line.strip_prefix('|') else {
+                continue;
+            };
+            let cells: Vec<&str> = row
+                .trim_end_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect();
+            if cells.len() < 4 {
+                continue;
+            }
+            let aliases = backticked(cells[0]);
+            if aliases.is_empty() {
+                // Header and `|---|---|` separator rows carry no aliases.
+                continue;
+            }
+            let canonicals = backticked(cells[1]);
+            assert_eq!(
+                canonicals.len(),
+                1,
+                "`{line}` must document exactly one canonical model id"
+            );
+            let auth_envs = backticked(cells[3]);
+            assert_eq!(
+                auth_envs.len(),
+                1,
+                "`{line}` must document exactly one auth env var"
+            );
+            for alias in aliases {
+                documented.push((
+                    alias.to_string(),
+                    canonicals[0].to_string(),
+                    auth_envs[0].to_string(),
+                ));
+            }
+        }
+
+        assert!(
+            !documented.is_empty(),
+            "parsed no alias rows out of the `## Model Aliases` table in rust/README.md"
+        );
+
+        for (alias, canonical, auth_env) in &documented {
+            let resolved = resolve_model_alias(alias);
+            assert_eq!(
+                resolved.as_str(),
+                canonical.as_str(),
+                "rust/README.md documents `{alias}` -> `{canonical}`, but resolve_model_alias returns `{resolved}`"
+            );
+            assert_eq!(
+                resolve_model_alias(&alias.to_ascii_uppercase()).as_str(),
+                resolved.as_str(),
+                "rust/README.md claims alias resolution is case-insensitive, but `{}` disagrees with `{alias}`",
+                alias.to_ascii_uppercase()
+            );
+            let metadata = super::metadata_for_model(&resolved).unwrap_or_else(|| {
+                panic!("no provider metadata for documented model `{canonical}`")
+            });
+            assert_eq!(
+                metadata.auth_env,
+                auth_env.as_str(),
+                "rust/README.md documents `{alias}` as needing `{auth_env}`, but `{canonical}` resolves to provider metadata with auth env `{}`",
+                metadata.auth_env
+            );
+        }
+
+        let documented_aliases: std::collections::BTreeSet<&str> = documented
+            .iter()
+            .map(|(alias, _, _)| alias.as_str())
+            .collect();
+        let resolver_aliases: std::collections::BTreeSet<&str> = super::MODEL_REGISTRY
+            .iter()
+            .map(|(alias, _)| *alias)
+            .collect();
+        assert_eq!(
+            documented_aliases, resolver_aliases,
+            "rust/README.md's `## Model Aliases` table and MODEL_REGISTRY have drifted apart"
+        );
+    }
+
+    // The table documents bare short names only, so the provider-prefixed form
+    // is deliberately *not* an alias. This pins that distinction, since the
+    // prefix is handled later (at request-build time) and a future refactor
+    // could easily fold it into alias resolution.
+    #[test]
+    fn provider_prefixed_alias_is_not_an_alias() {
+        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-7");
+        assert_eq!(resolve_model_alias("anthropic/opus"), "anthropic/opus");
+        assert_eq!(resolve_model_alias("xai/grok"), "xai/grok");
     }
 
     #[test]
@@ -1077,6 +1250,18 @@ mod tests {
         assert_eq!(meta.base_url_env, "OPENAI_BASE_URL");
 
         let kind = detect_provider_kind("local/Qwen/Qwen3.6-27B-FP8");
+        assert_eq!(kind, ProviderKind::OpenAi);
+    }
+
+    #[test]
+    fn groq_prefix_routes_to_openai_not_anthropic() {
+        let meta = super::metadata_for_model("groq/compound")
+            .expect("groq/ prefix must resolve to OpenAI-compatible metadata");
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+        assert_eq!(meta.auth_env, "OPENAI_API_KEY");
+        assert_eq!(meta.base_url_env, "OPENAI_BASE_URL");
+
+        let kind = detect_provider_kind("groq/compound");
         assert_eq!(kind, ProviderKind::OpenAi);
     }
 
@@ -1380,6 +1565,27 @@ mod tests {
     }
 
     #[test]
+    fn returns_context_window_metadata_for_groq_compound_models() {
+        let compound =
+            model_token_limit("groq/compound").expect("groq/compound should have token limits");
+        assert_eq!(compound.max_output_tokens, 8_192);
+        assert_eq!(compound.context_window_tokens, 131_072);
+
+        let compound_mini = model_token_limit("groq/compound-mini")
+            .expect("groq/compound-mini should have token limits");
+        assert_eq!(compound_mini.max_output_tokens, 8_192);
+        assert_eq!(compound_mini.context_window_tokens, 131_072);
+    }
+
+    #[test]
+    fn returns_context_window_metadata_for_groq_llama4_scout() {
+        let scout = model_token_limit("groq/meta-llama/llama-4-scout-17b-16e-instruct")
+            .expect("groq llama 4 scout should have token limits");
+        assert_eq!(scout.max_output_tokens, 8_192);
+        assert_eq!(scout.context_window_tokens, 131_072);
+    }
+
+    #[test]
     fn preflight_blocks_oversized_requests_for_kimi_models() {
         let request = MessageRequest {
             model: "kimi-k2.5".to_string(),
@@ -1501,6 +1707,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint();
@@ -1513,12 +1720,93 @@ NO_EQUALS_LINE
     }
 
     #[test]
+    fn anthropic_missing_credentials_hint_names_a_custom_base_url() {
+        // given
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set(
+            "ANTHROPIC_BASE_URL",
+            Some("https://api.deepseek.com/anthropic"),
+        );
+
+        // when
+        let hint = anthropic_missing_credentials_hint()
+            .expect("a configured non-Anthropic endpoint should produce a hint");
+
+        // then
+        assert!(
+            hint.contains("https://api.deepseek.com/anthropic"),
+            "hint should name the configured endpoint so the user recognizes their own setting: {hint}"
+        );
+        assert!(
+            hint.contains("not the Anthropic API"),
+            "hint should state that the endpoint is not Anthropic: {hint}"
+        );
+        assert!(
+            hint.contains("ANTHROPIC_API_KEY") && hint.contains("ANTHROPIC_AUTH_TOKEN"),
+            "hint should keep naming the env vars that carry the credential: {hint}"
+        );
+    }
+
+    #[test]
+    fn anthropic_missing_credentials_hint_prefers_custom_base_url_over_foreign_creds() {
+        // given
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set(
+            "ANTHROPIC_BASE_URL",
+            Some("https://api.deepseek.com/anthropic"),
+        );
+
+        // when
+        let hint = anthropic_missing_credentials_hint()
+            .expect("a configured non-Anthropic endpoint should produce a hint");
+
+        // then
+        assert!(
+            hint.contains("ANTHROPIC_BASE_URL"),
+            "the endpoint the user configured is a fact and should win over a guess about intent: {hint}"
+        );
+        assert!(
+            !hint.contains("openai/"),
+            "the foreign-provider routing hint should not displace the base-url hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn anthropic_missing_credentials_hint_is_none_for_the_default_base_url() {
+        // given
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set(
+            "ANTHROPIC_BASE_URL",
+            Some(super::anthropic::DEFAULT_BASE_URL),
+        );
+
+        // when
+        let hint = anthropic_missing_credentials_hint();
+
+        // then
+        assert!(
+            hint.is_none(),
+            "pointing at the real Anthropic API should not produce a base-url hint, got {hint:?}"
+        );
+    }
+
+    #[test]
     fn anthropic_missing_credentials_hint_detects_openai_api_key_and_recommends_openai_prefix() {
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint()
@@ -1550,6 +1838,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint()
@@ -1577,6 +1866,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint()
@@ -1604,6 +1894,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint()
@@ -1627,6 +1918,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let error = anthropic_missing_credentials();
@@ -1661,6 +1953,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let error = anthropic_missing_credentials();
@@ -1709,6 +2002,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some(""));
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint();

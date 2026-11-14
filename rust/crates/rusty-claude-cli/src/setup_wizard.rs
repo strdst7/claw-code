@@ -2,14 +2,12 @@ use std::io::{self, IsTerminal, Write};
 
 use runtime::{save_user_provider_settings, ConfigLoader, RuntimeProviderConfig};
 
-use serde_json;
-
 const PROVIDERS: &[(&str, &str, &str)] = &[
     ("1", "Anthropic", "anthropic"),
     ("2", "xAI / Grok", "xai"),
     ("3", "OpenAI", "openai"),
     ("4", "DashScope (Qwen/Kimi)", "dashscope"),
-    ("5", "Custom (OpenAI-compat)", "openai"),
+    ("5", "Custom (OpenAI-compat)", "custom-openai"),
 ];
 
 const PROVIDER_MODELS: &[(&str, &[&str])] = &[
@@ -27,6 +25,8 @@ const DEFAULT_BASE_URLS: &[(&str, &str)] = &[
         "dashscope",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ),
+    // Custom OpenAI has no default; user must supply.
+    ("custom-openai", ""),
 ];
 
 const API_KEY_ENV_VARS: &[(&str, &str)] = &[
@@ -34,6 +34,7 @@ const API_KEY_ENV_VARS: &[(&str, &str)] = &[
     ("xai", "XAI_API_KEY"),
     ("openai", "OPENAI_API_KEY"),
     ("dashscope", "DASHSCOPE_API_KEY"),
+    ("custom-openai", "CLAWCUSTOMOPENAI_API_KEY"),
 ];
 
 pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
@@ -177,6 +178,7 @@ fn prompt_base_url(
         "xai" => "XAI_BASE_URL",
         "openai" => "OPENAI_BASE_URL",
         "dashscope" => "DASHSCOPE_BASE_URL",
+        "custom-openai" => "CLAWCUSTOMOPENAI_BASE_URL",
         _ => "BASE_URL",
     };
     let env_set = std::env::var(env_var).ok().is_some_and(|v| !v.is_empty());
@@ -214,7 +216,11 @@ fn prompt_model(
     if !aliases.is_empty() {
         println!("    Common: {}", aliases.join(", "));
     }
-    println!("    Or enter any model name (e.g. openai/gpt-4.1-mini for custom routing)");
+    if kind == "custom-openai" {
+        println!("    Or enter any model name (e.g. custom/gpt-4.1 for custom routing)");
+    } else {
+        println!("    Or enter any model name (e.g. openai/gpt-4.1-mini for custom routing)");
+    }
 
     let input = read_line(&format!("  Model [{current_model}]: "))?;
     if input.trim().is_empty() {

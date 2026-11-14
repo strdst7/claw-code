@@ -29,7 +29,7 @@ impl Default for TridentConfig {
 }
 
 /// Statistics from a Trident compaction run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TridentStats {
     pub superseded_count: usize,
     pub collapsed_chains: usize,
@@ -39,21 +39,6 @@ pub struct TridentStats {
     pub tokens_saved_estimate: usize,
     pub original_message_count: usize,
     pub final_message_count: usize,
-}
-
-impl Default for TridentStats {
-    fn default() -> Self {
-        Self {
-            superseded_count: 0,
-            collapsed_chains: 0,
-            messages_collapsed: 0,
-            clusters_found: 0,
-            messages_clustered: 0,
-            tokens_saved_estimate: 0,
-            original_message_count: 0,
-            final_message_count: 0,
-        }
-    }
 }
 
 impl TridentStats {
@@ -192,7 +177,7 @@ fn stage1_supersede(messages: &[ConversationMessage]) -> (Vec<ConversationMessag
 
     let mut obsolete_indices: BTreeSet<usize> = BTreeSet::new();
 
-    for (_path, ops) in &file_ops {
+    for ops in file_ops.values() {
         if ops.len() < 2 {
             continue;
         }
@@ -205,14 +190,52 @@ fn stage1_supersede(messages: &[ConversationMessage]) -> (Vec<ConversationMessag
 
         if let Some(last_write) = last_write_idx {
             for op in ops {
-                if op.op_type == FileOp::Read && op.index < last_write {
-                    obsolete_indices.insert(op.index);
-                } else if (op.op_type == FileOp::Write || op.op_type == FileOp::Edit)
-                    && op.index < last_write
-                {
+                if op.index < last_write {
                     obsolete_indices.insert(op.index);
                 }
             }
+        }
+    }
+
+    // A tool result is only meaningful together with the tool use that
+    // produced it. Dropping the tool use while keeping its result leaves an
+    // orphaned `tool_result` block, which providers reject with
+    // "tool_result blocks must be a response to a preceding tool_use".
+    let dropped_tool_use_ids: BTreeSet<&str> = obsolete_indices
+        .iter()
+        .filter_map(|index| messages.get(*index))
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    for (index, message) in messages.iter().enumerate() {
+        if obsolete_indices.contains(&index) {
+            continue;
+        }
+        let answers_dropped_tool_use = message.blocks.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult { tool_use_id, .. }
+                    if dropped_tool_use_ids.contains(tool_use_id.as_str())
+            )
+        });
+        if !answers_dropped_tool_use {
+            continue;
+        }
+        // Keep a message that still carries a surviving tool use: dropping it
+        // would orphan that tool use instead.
+        let keeps_surviving_tool_use = message.blocks.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolUse { id, .. }
+                    if !dropped_tool_use_ids.contains(id.as_str())
+            )
+        });
+        if !keeps_surviving_tool_use {
+            obsolete_indices.insert(index);
         }
     }
 
@@ -239,18 +262,11 @@ fn extract_file_operation(block: &ContentBlock) -> Option<(String, FileOp)> {
             };
             Some((path, op_type))
         }
-        ContentBlock::ToolResult {
-            tool_name, output, ..
-        } => {
-            let path = extract_path_from_tool_output(tool_name, output)?;
-            let op_type = match tool_name.as_str() {
-                "read_file" | "Read" => FileOp::Read,
-                "write_file" | "Write" => FileOp::Write,
-                "edit_file" | "Edit" => FileOp::Edit,
-                _ => return None,
-            };
-            Some((path, op_type))
-        }
+        // A tool result is the answer half of a tool use, not an independent
+        // file operation. Counting it as one shifts `last_write` past the
+        // write it belongs to, which makes the newest write look obsolete
+        // and splits its tool-use/tool-result pair.
+        ContentBlock::ToolResult { .. } => None,
         ContentBlock::Text { .. } => None,
         ContentBlock::Thinking { .. } => None,
     }
@@ -325,7 +341,7 @@ fn stage2_collapse(
                     usage: None,
                 });
             } else {
-                result.extend(buffer.drain(..));
+                result.append(&mut buffer);
             }
             buffer.clear();
             result.push(msg.clone());
@@ -476,7 +492,7 @@ fn stage3_cluster(
     }
 
     let total_clustered: usize = cluster_assignments.len();
-    let clusters_found = cluster_id as usize;
+    let clusters_found = cluster_id;
 
     let mut result: Vec<ConversationMessage> = Vec::new();
     let mut cluster_buffers: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -677,7 +693,7 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::compact::CompactionConfig;
-    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, Session};
 
     #[test]
     fn stage1_removes_obsolete_file_reads() {
@@ -733,10 +749,94 @@ mod tests {
     }
 
     #[test]
+    fn stage1_keeps_tool_use_and_result_paired() {
+        // Realistic transcript: the model reads the same file twice and then
+        // rewrites it. Stage 1 must drop the obsolete reads *and* their tool
+        // results, but it must never leave a `tool_result` behind without the
+        // `tool_use` that produced it: providers reject such requests with
+        // "tool_result blocks must be a response to a preceding tool_use".
+        let messages = vec![
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "1".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"src/main.rs"}"#.to_string(),
+            }]),
+            ConversationMessage::tool_result(
+                "1",
+                "read_file",
+                r#"{"type":"text","file":{"filePath":"/ws/src/main.rs","content":"old"}}"#,
+                false,
+            ),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "2".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"src/main.rs"}"#.to_string(),
+            }]),
+            ConversationMessage::tool_result(
+                "2",
+                "read_file",
+                r#"{"type":"text","file":{"filePath":"/ws/src/main.rs","content":"old"}}"#,
+                false,
+            ),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "3".to_string(),
+                name: "write_file".to_string(),
+                input: r#"{"path":"src/main.rs","content":"new"}"#.to_string(),
+            }]),
+            ConversationMessage::tool_result(
+                "3",
+                "write_file",
+                r#"{"type":"update","filePath":"/ws/src/main.rs","content":"new"}"#,
+                false,
+            ),
+        ];
+
+        let (kept, superseded) = stage1_supersede(&messages);
+        assert!(superseded > 0, "obsolete reads should be superseded");
+
+        let tool_use_ids: BTreeSet<&str> = kept
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        for message in &kept {
+            for block in &message.blocks {
+                if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                    assert!(
+                        tool_use_ids.contains(tool_use_id.as_str()),
+                        "orphaned tool_result for tool_use {tool_use_id}"
+                    );
+                }
+            }
+        }
+
+        // The most recent write survives, together with its tool result.
+        let has_tool_use = |id: &str| {
+            kept.iter().any(|message| {
+                message.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::ToolUse { id: tool_use_id, .. } if tool_use_id == id),
+                )
+            })
+        };
+        let has_tool_result = |id: &str| {
+            kept.iter().any(|message| {
+                message.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id),
+                )
+            })
+        };
+        assert!(has_tool_use("3"), "the newest write must survive");
+        assert!(has_tool_result("3"), "its tool result must survive too");
+    }
+
+    #[test]
     fn stage2_collapses_chatty_messages() {
         let mut messages = vec![];
         for i in 0..6 {
-            messages.push(ConversationMessage::user_text(&format!("ok {i}")));
+            messages.push(ConversationMessage::user_text(format!("ok {i}")));
             messages.push(ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: format!("got {i}"),
             }]));
@@ -767,9 +867,9 @@ mod tests {
                 },
             ]));
             messages.push(ConversationMessage::tool_result(
-                &format!("read_{i}"),
+                format!("read_{i}"),
                 "read_file",
-                &format!(r#"{{"path":"src/{i}.rs","content":"data {i}"}}"#),
+                format!(r#"{{"path":"src/{i}.rs","content":"data {i}"}}"#),
                 false,
             ));
         }

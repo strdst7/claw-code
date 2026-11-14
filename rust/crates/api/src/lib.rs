@@ -1,4 +1,5 @@
 mod client;
+
 mod error;
 mod http_client;
 mod prompt_cache;
@@ -8,7 +9,8 @@ mod types;
 
 pub use client::{
     oauth_token_is_expired, read_base_url, read_xai_base_url, resolve_saved_oauth_token,
-    resolve_startup_auth_source, MessageStream, OAuthTokenSet, ProviderClient,
+    resolve_startup_auth_source, MessageStream, OAuthTokenSet, ProviderClient, ProviderConfig,
+    ProviderConfigKind,
 };
 pub use error::ApiError;
 pub use http_client::{
@@ -22,9 +24,9 @@ pub use prompt_cache::{
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{
     build_chat_completion_request, check_request_body_size, estimate_request_body_size,
-    flatten_tool_result_content, is_reasoning_model, model_rejects_is_error_field,
-    model_requires_reasoning_content_in_history, translate_message, OpenAiCompatClient,
-    OpenAiCompatConfig,
+    flatten_tool_result_content, is_local_openai_compatible_base_url, is_reasoning_model,
+    model_rejects_is_error_field, model_requires_reasoning_content_in_history, translate_message,
+    OpenAiCompatClient, OpenAiCompatConfig,
 };
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
@@ -44,3 +46,13 @@ pub use telemetry::{
     MemoryTelemetrySink, SessionTraceRecord, SessionTracer, TelemetryEvent, TelemetrySink,
     DEFAULT_ANTHROPIC_VERSION,
 };
+
+// Environment variables are shared by every test module in this process.
+// Module-local locks cannot protect provider tests from each other.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
